@@ -29,6 +29,7 @@ wandb.init(mode="offline")
 model_type = "leftnet"
 version = "0"
 project = "OAReactDiff"
+
 # ---EGNNDynamics---
 egnn_config = dict(
     in_node_nf=8,  # embedded dim before injecting to egnn

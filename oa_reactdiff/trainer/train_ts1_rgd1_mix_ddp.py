@@ -31,7 +31,7 @@ wandb.init(mode="offline")
 
 model_type = "leftnet"
 version = "0"
-project = "OAReactDiff-new-mix-dim"
+project = "OAReactDiff-new-mix-dim2"
 # ---EGNNDynamics---
 egnn_config = dict(
     in_node_nf=8,  # embedded dim before injecting to egnn
@@ -230,8 +230,8 @@ trainer = Trainer(
     accumulate_grad_batches=1,
     gradient_clip_val=training_config["gradient_clip_val"],
     # limit_train_batches=200,
-    limit_train_batches=800,
-    limit_val_batches=20,
+    limit_train_batches=1.0,
+    limit_val_batches=1.0,
     # max_time="00:10:00:00",
 )
 
@@ -243,13 +243,13 @@ trainer = Trainer(
 # trainer.fit(ddpm,ckpt_path=ckpt)
 
 trainer.fit(ddpm)
-trainer.save_checkpoint("our_new_pretrained-ts1x-rgd1-diff-h200-dim.ckpt")
+trainer.save_checkpoint("our_new_pretrained-ts1x-rgd1-diff-h200-dim-2.ckpt")
 
 
 """
 
 cd oa_reactdiff/trainer
-python train_ts1_rgd1_mix_ddp.py | tee new_train_mix-dim.log
+python train_ts1_rgd1_mix_ddp.py | tee new_train_mix-dim2.log
 
 export PYTHONPATH=/inspire/qb-ilm/project/chemicalreaction/czxs25220150/projects/OAReactDiff:$PYTHONPATH
 
