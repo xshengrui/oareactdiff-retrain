@@ -1,6 +1,7 @@
 import argparse
 import pickle
 import sys
+import tarfile
 import time
 from pathlib import Path
 
@@ -20,6 +21,13 @@ from oa_reactdiff.trainer.pl_trainer import DDPMModule
 
 DEFAULT_DATASET_PATH = PROJECT_ROOT / "oa_reactdiff" / "data" / "transition1x" / "valid_addprop.pkl"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "outputs" / "xyz_from_ckpt"
+ELEMENT_TO_ATOMIC_NUMBER = {
+    "H": 1,
+    "C": 6,
+    "N": 7,
+    "O": 8,
+    "F": 9,
+}
 
 
 def parse_args():
@@ -103,6 +111,128 @@ def resolve_device(device_arg: str) -> torch.device:
 def load_pickle(path: Path):
     with open(path, "rb") as handle:
         return pickle.load(handle)
+
+
+def parse_xyz_bytes(content: bytes, member_name: str):
+    lines = content.decode("utf-8").splitlines()
+    if not lines:
+        raise ValueError(f"Empty xyz file: {member_name}")
+
+    natoms = int(lines[0].strip())
+    atom_lines = [line.strip() for line in lines[2 : 2 + natoms] if line.strip()]
+    if len(atom_lines) != natoms:
+        raise ValueError(
+            f"Expected {natoms} atoms in {member_name}, found {len(atom_lines)}"
+        )
+
+    charges = []
+    positions = []
+    for line in atom_lines:
+        fields = line.split()
+        if len(fields) < 4:
+            raise ValueError(f"Malformed atom line in {member_name}: {line}")
+        element = fields[0]
+        if element not in ELEMENT_TO_ATOMIC_NUMBER:
+            raise ValueError(f"Unsupported element {element!r} in {member_name}")
+        charges.append(ELEMENT_TO_ATOMIC_NUMBER[element])
+        positions.append([float(fields[1]), float(fields[2]), float(fields[3])])
+    return natoms, charges, np.asarray(positions, dtype=np.float32)
+
+
+def empty_fragment_dataset():
+    return {
+        "num_atoms": [],
+        "charges": [],
+        "fragments": [],
+        "positions": [],
+        "rxn": [],
+    }
+
+
+def build_dataset_from_raw_tar(tar_path: Path):
+    species_to_file = {
+        "reactant": "R.xyz",
+        "transition_state": "TS.xyz",
+        "product": "P.xyz",
+    }
+    records = {}
+    with tarfile.open(tar_path, "r:gz") as archive:
+        for member in archive.getmembers():
+            if not member.isfile():
+                continue
+            parts = Path(member.name).parts
+            if len(parts) < 3 or parts[-1] not in species_to_file.values():
+                continue
+            reaction_id = parts[-2]
+            records.setdefault(reaction_id, {})
+            extracted = archive.extractfile(member)
+            if extracted is None:
+                continue
+            records[reaction_id][parts[-1]] = parse_xyz_bytes(
+                extracted.read(),
+                member.name,
+            )
+
+    complete_reactions = sorted(
+        reaction_id
+        for reaction_id, files in records.items()
+        if all(filename in files for filename in species_to_file.values())
+    )
+    if not complete_reactions:
+        raise ValueError(f"No complete R.xyz/P.xyz/TS.xyz reactions found in {tar_path}")
+
+    dataset = {
+        "reactant": empty_fragment_dataset(),
+        "transition_state": empty_fragment_dataset(),
+        "product": empty_fragment_dataset(),
+        "single_fragment": [],
+        "use_ind": list(range(len(complete_reactions))),
+    }
+
+    for reaction_id in complete_reactions:
+        reference_charges = None
+        reference_natoms = None
+        for species, filename in species_to_file.items():
+            natoms, charges, positions = records[reaction_id][filename]
+            if reference_natoms is None:
+                reference_natoms = natoms
+                reference_charges = charges
+            elif natoms != reference_natoms or charges != reference_charges:
+                raise ValueError(
+                    f"Inconsistent atom order/count for {reaction_id}: {filename}"
+                )
+
+            dataset[species]["num_atoms"].append(natoms)
+            dataset[species]["charges"].append(charges)
+            dataset[species]["fragments"].append([0] * natoms)
+            dataset[species]["positions"].append(positions)
+            dataset[species]["rxn"].append(reaction_id)
+        dataset["single_fragment"].append(1)
+
+    return dataset
+
+
+def ensure_model_input_dataset(dataset_path: Path, output_dir: Path):
+    suffixes = "".join(dataset_path.suffixes)
+    if suffixes.endswith(".tar.gz"):
+        processed_dir = output_dir / "_processed_inputs"
+        processed_dir.mkdir(parents=True, exist_ok=True)
+        processed_path = processed_dir / f"{dataset_path.name[:-7]}.pkl"
+        needs_conversion = (
+            not processed_path.exists()
+            or processed_path.stat().st_mtime < dataset_path.stat().st_mtime
+        )
+        if needs_conversion:
+            print(f"converting raw tar dataset to model input pkl: {processed_path}")
+            dataset = build_dataset_from_raw_tar(dataset_path)
+            with open(processed_path, "wb") as handle:
+                pickle.dump(dataset, handle)
+            print(
+                f"converted_reactions={len(dataset['single_fragment'])} "
+                f"source={dataset_path}"
+            )
+        return processed_path
+    return dataset_path
 
 
 def compute_selected_indices(raw_dataset, single_frag_only: bool, use_by_ind: bool):
@@ -247,6 +377,7 @@ def main():
     dataset_path = Path(args.dataset_path).resolve()
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    dataset_path = ensure_model_input_dataset(dataset_path, output_dir)
 
     device = resolve_device(args.device)
     dataset_device = "cuda" if device.type == "cuda" else "cpu"
