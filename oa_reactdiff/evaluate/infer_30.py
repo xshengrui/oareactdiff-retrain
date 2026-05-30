@@ -549,5 +549,19 @@ python oa_reactdiff/evaluate/infer_30.py \
   --resamplings 5 \
   --jump-length 5 \
   --batch-size 32
+
+
+
+还加了批量运行脚本 run_gdb_raw_infer_30.sh。上传服务器后直接运行：
+bash oa_reactdiff/evaluate/run_gdb_raw_infer_30.sh
+
+默认使用：
+
+oa_reactdiff/trainer/our_new_pretrained-ts1x-diff.ckpt
+
+输出到：
+
+output/gdb_raw_rollouts/GDB-10
+output/gdb_raw_rollouts/GDB-17
   
 """
