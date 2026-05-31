@@ -6,6 +6,7 @@ OUTPUT_ROOT="${OUTPUT_ROOT:-output/gdb_raw_rollouts}"
 DEVICE="${DEVICE:-auto}"
 BATCH_SIZE="${BATCH_SIZE:-32}"
 TIMESTEPS="${TIMESTEPS:-250}"
+NOISE_SCHEDULE="${NOISE_SCHEDULE:-cosine}"
 RESAMPLINGS="${RESAMPLINGS:-5}"
 JUMP_LENGTH="${JUMP_LENGTH:-5}"
 REPEATS="${REPEATS:-30}"
@@ -17,6 +18,7 @@ python oa_reactdiff/evaluate/infer_30.py \
   --output-dir "${OUTPUT_ROOT}/GDB-10" \
   --repeats "${REPEATS}" \
   --timesteps "${TIMESTEPS}" \
+  --noise-schedule "${NOISE_SCHEDULE}" \
   --resamplings "${RESAMPLINGS}" \
   --jump-length "${JUMP_LENGTH}" \
   --batch-size "${BATCH_SIZE}" \
@@ -29,6 +31,7 @@ python oa_reactdiff/evaluate/infer_30.py \
   --output-dir "${OUTPUT_ROOT}/GDB-17" \
   --repeats "${REPEATS}" \
   --timesteps "${TIMESTEPS}" \
+  --noise-schedule "${NOISE_SCHEDULE}" \
   --resamplings "${RESAMPLINGS}" \
   --jump-length "${JUMP_LENGTH}" \
   --batch-size "${BATCH_SIZE}" \

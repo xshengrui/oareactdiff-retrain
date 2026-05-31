@@ -14,13 +14,13 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
 from oa_reactdiff.dataset.transition1x import ProcessedTS1x
-from oa_reactdiff.diffusion._normalizer import FEATURE_MAPPING
-from oa_reactdiff.diffusion._schedule import DiffSchedule, PredefinedNoiseSchedule
-from oa_reactdiff.trainer.pl_trainer import DDPMModule
 
 
 DEFAULT_DATASET_PATH = PROJECT_ROOT / "oa_reactdiff" / "data" / "transition1x" / "valid_addprop.pkl"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "outputs" / "xyz_from_ckpt"
+DEFAULT_CHECKPOINT_PATH = (
+    PROJECT_ROOT / "oa_reactdiff" / "trainer" / "our_new_pretrained-ts1x-diff.ckpt"
+)
 ELEMENT_TO_ATOMIC_NUMBER = {
     "H": 1,
     "C": 6,
@@ -36,7 +36,7 @@ def parse_args():
     )
     parser.add_argument(
         "--checkpoint",
-        required=True,
+        default=str(DEFAULT_CHECKPOINT_PATH),
         type=str,
         help="Path to the trained .ckpt file.",
     )
@@ -60,6 +60,12 @@ def parse_args():
     )
     parser.add_argument("--batch-size", default=8, type=int, help="Batch size for inference.")
     parser.add_argument("--timesteps", default=250, type=int, help="Diffusion timesteps.")
+    parser.add_argument(
+        "--noise-schedule",
+        default="cosine",
+        type=str,
+        help="Noise schedule used for inference. Defaults to cosine to match this checkpoint.",
+    )
     parser.add_argument("--resamplings", default=5, type=int, help="RePaint resamplings.")
     parser.add_argument("--jump-length", default=5, type=int, help="RePaint jump length.")
     parser.add_argument("--repeats", default=30, type=int, help="Number of TS predictions per sample.")
@@ -98,6 +104,11 @@ def parse_args():
         default=1,
         type=int,
         help="Whether to also save ground-truth r/ts/p into true_rts_p.xyz (1 or 0).",
+    )
+    parser.add_argument(
+        "--validate-only",
+        action="store_true",
+        help="Only convert/validate the dataset input and exit without loading the model.",
     )
     return parser.parse_args()
 
@@ -235,6 +246,89 @@ def ensure_model_input_dataset(dataset_path: Path, output_dir: Path):
     return dataset_path
 
 
+def validate_model_input_dataset(dataset_path: Path):
+    dataset = load_pickle(dataset_path)
+    required_species = ["reactant", "transition_state", "product"]
+    required_keys = ["num_atoms", "charges", "positions", "rxn"]
+
+    sample_count = len(dataset["single_fragment"])
+    issues = []
+    max_abs_coord = 0.0
+    max_span = 0.0
+    atom_counts = []
+    atomic_numbers = set()
+
+    for species in required_species:
+        if species not in dataset:
+            issues.append(f"missing species: {species}")
+            continue
+        for key in required_keys:
+            if key not in dataset[species]:
+                issues.append(f"missing key: {species}.{key}")
+                continue
+            if len(dataset[species][key]) != sample_count:
+                issues.append(
+                    f"length mismatch: {species}.{key} has "
+                    f"{len(dataset[species][key])}, expected {sample_count}"
+                )
+
+    for idx in range(sample_count):
+        ref_charges = None
+        ref_natoms = None
+        for species in required_species:
+            natoms = int(dataset[species]["num_atoms"][idx])
+            charges = list(dataset[species]["charges"][idx])[:natoms]
+            positions = np.asarray(dataset[species]["positions"][idx])[:natoms]
+
+            if positions.shape != (natoms, 3):
+                issues.append(
+                    f"bad position shape at sample={idx} species={species}: "
+                    f"{positions.shape}, natoms={natoms}"
+                )
+            if not np.isfinite(positions).all():
+                issues.append(f"non-finite positions at sample={idx} species={species}")
+            if len(charges) != natoms:
+                issues.append(
+                    f"charge length mismatch at sample={idx} species={species}: "
+                    f"{len(charges)}, natoms={natoms}"
+                )
+            unsupported = sorted(set(charges) - set(ELEMENT_TO_ATOMIC_NUMBER.values()))
+            if unsupported:
+                issues.append(
+                    f"unsupported atomic numbers at sample={idx} "
+                    f"species={species}: {unsupported}"
+                )
+
+            if ref_natoms is None:
+                ref_natoms = natoms
+                ref_charges = charges
+            elif natoms != ref_natoms or charges != ref_charges:
+                issues.append(
+                    f"R/TS/P atom order mismatch at sample={idx} species={species}"
+                )
+
+            max_abs_coord = max(max_abs_coord, float(np.max(np.abs(positions))))
+            max_span = max(max_span, float(np.ptp(positions, axis=0).max()))
+            atomic_numbers.update(charges)
+
+        atom_counts.append(ref_natoms)
+
+    print(f"validated_dataset={dataset_path}")
+    print(f"samples={sample_count}")
+    if atom_counts:
+        print(
+            "natoms min/median/max="
+            f"{min(atom_counts)}/{np.median(atom_counts):.1f}/{max(atom_counts)}"
+        )
+    print(f"atomic_numbers={sorted(atomic_numbers)}")
+    print(f"max_abs_coord={max_abs_coord:.6g} max_molecular_span={max_span:.6g}")
+    print(f"issues={len(issues)}")
+    for issue in issues[:20]:
+        print(f"issue: {issue}")
+    if issues:
+        raise ValueError("Dataset validation failed.")
+
+
 def compute_selected_indices(raw_dataset, single_frag_only: bool, use_by_ind: bool):
     if single_frag_only:
         single_frag_inds = np.where(np.array(raw_dataset["single_fragment"]) == 1)[0]
@@ -306,6 +400,8 @@ def build_sample_metadata(dataset, dataset_index: int, source_index):
 
 
 def load_ddpm_from_checkpoint(checkpoint_path: Path, device: torch.device):
+    from oa_reactdiff.trainer.pl_trainer import DDPMModule
+
     checkpoint = torch.load(
         str(checkpoint_path),
         map_location=device,
@@ -317,11 +413,13 @@ def load_ddpm_from_checkpoint(checkpoint_path: Path, device: torch.device):
 
 
 def set_new_schedule_local(
-    ddpm_trainer: DDPMModule,
+    ddpm_trainer,
     timesteps: int,
     device: torch.device,
     noise_schedule: str = "polynomial_2",
 ):
+    from oa_reactdiff.diffusion._schedule import DiffSchedule, PredefinedNoiseSchedule
+
     gamma_module = PredefinedNoiseSchedule(
         noise_schedule=noise_schedule,
         timesteps=timesteps,
@@ -338,11 +436,13 @@ def set_new_schedule_local(
 
 def inpaint_batch_local(
     batch,
-    ddpm_trainer: DDPMModule,
+    ddpm_trainer,
     resamplings: int,
     jump_length: int,
     frag_fixed=None,
 ):
+    from oa_reactdiff.diffusion._normalizer import FEATURE_MAPPING
+
     if frag_fixed is None:
         frag_fixed = [0, 2]
 
@@ -378,6 +478,10 @@ def main():
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     dataset_path = ensure_model_input_dataset(dataset_path, output_dir)
+
+    if args.validate_only:
+        validate_model_input_dataset(dataset_path)
+        return
 
     device = resolve_device(args.device)
     dataset_device = "cuda" if device.type == "cuda" else "cpu"
@@ -423,6 +527,7 @@ def main():
         ddpm_trainer=ddpm_trainer,
         timesteps=args.timesteps,
         device=device,
+        noise_schedule=args.noise_schedule,
     )
     ddpm_trainer.eval()
 
