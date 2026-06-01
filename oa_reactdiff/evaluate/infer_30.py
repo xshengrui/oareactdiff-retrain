@@ -21,13 +21,20 @@ DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "outputs" / "xyz_from_ckpt"
 DEFAULT_CHECKPOINT_PATH = (
     PROJECT_ROOT / "oa_reactdiff" / "trainer" / "our_new_pretrained-ts1x-diff.ckpt"
 )
-RAW_TAR_CONVERTER_VERSION = 2
+RAW_TAR_CONVERTER_VERSION = 3
 ELEMENT_TO_ATOMIC_NUMBER = {
     "H": 1,
     "C": 6,
     "N": 7,
     "O": 8,
     "F": 9,
+}
+ATOMIC_NUMBER_TO_COVALENT_RADIUS = {
+    1: 0.31,
+    6: 0.76,
+    7: 0.71,
+    8: 0.66,
+    9: 0.57,
 }
 
 
@@ -72,9 +79,12 @@ def parse_args():
     parser.add_argument("--repeats", default=30, type=int, help="Number of TS predictions per sample.")
     parser.add_argument(
         "--single-frag-only",
-        default=0,
+        default=1,
         type=int,
-        help="Whether to keep only single-fragment reactions (1 or 0). Default 0 keeps all.",
+        help=(
+            "Whether to keep only single-fragment reactions (1 or 0). "
+            "Default 1 matches this checkpoint's training config."
+        ),
     )
     parser.add_argument(
         "--use-by-ind",
@@ -119,6 +129,16 @@ def parse_args():
         "--validate-only",
         action="store_true",
         help="Only convert/validate the dataset input and exit without loading the model.",
+    )
+    parser.add_argument(
+        "--stop-on-nan",
+        action="store_true",
+        help="Stop inference and print batch/sample diagnostics if generated tensors contain NaN/Inf.",
+    )
+    parser.add_argument(
+        "--log-batches",
+        action="store_true",
+        help="Print rxn ids and geometry diagnostics before each inference batch.",
     )
     return parser.parse_args()
 
@@ -170,6 +190,37 @@ def empty_fragment_dataset():
     }
 
 
+def infer_connected_fragments(charges, positions, bond_scale=1.25, bond_slack=0.25):
+    natoms = len(charges)
+    parents = list(range(natoms))
+
+    def find(atom_index):
+        while parents[atom_index] != atom_index:
+            parents[atom_index] = parents[parents[atom_index]]
+            atom_index = parents[atom_index]
+        return atom_index
+
+    def union(atom_i, atom_j):
+        root_i = find(atom_i)
+        root_j = find(atom_j)
+        if root_i != root_j:
+            parents[root_j] = root_i
+
+    for atom_i in range(natoms):
+        for atom_j in range(atom_i + 1, natoms):
+            radius_i = ATOMIC_NUMBER_TO_COVALENT_RADIUS[charges[atom_i]]
+            radius_j = ATOMIC_NUMBER_TO_COVALENT_RADIUS[charges[atom_j]]
+            cutoff = bond_scale * (radius_i + radius_j) + bond_slack
+            distance = np.linalg.norm(positions[atom_i] - positions[atom_j])
+            if distance <= cutoff:
+                union(atom_i, atom_j)
+
+    fragments_by_root = {}
+    for atom_index in range(natoms):
+        fragments_by_root.setdefault(find(atom_index), []).append(atom_index)
+    return list(fragments_by_root.values())
+
+
 def build_dataset_from_raw_tar(tar_path: Path):
     species_to_file = {
         "reactant": "R.xyz",
@@ -214,6 +265,7 @@ def build_dataset_from_raw_tar(tar_path: Path):
     for reaction_id in complete_reactions:
         reference_charges = None
         reference_natoms = None
+        reaction_fragments = {}
         for species, filename in species_to_file.items():
             natoms, charges, positions = records[reaction_id][filename]
             if reference_natoms is None:
@@ -224,12 +276,16 @@ def build_dataset_from_raw_tar(tar_path: Path):
                     f"Inconsistent atom order/count for {reaction_id}: {filename}"
                 )
 
+            fragments = infer_connected_fragments(charges, positions)
+            reaction_fragments[species] = fragments
             dataset[species]["num_atoms"].append(natoms)
             dataset[species]["charges"].append(charges)
-            dataset[species]["fragments"].append([list(range(natoms))])
+            dataset[species]["fragments"].append(fragments)
             dataset[species]["positions"].append(positions)
             dataset[species]["rxn"].append(reaction_id)
-        dataset["single_fragment"].append(1)
+        dataset["single_fragment"].append(
+            int(all(len(fragments) == 1 for fragments in reaction_fragments.values()))
+        )
 
     return dataset
 
@@ -274,6 +330,7 @@ def validate_model_input_dataset(dataset_path: Path):
     max_span = 0.0
     atom_counts = []
     atomic_numbers = set()
+    fragment_counts = {species: [] for species in required_species}
 
     for species in required_species:
         if species not in dataset:
@@ -297,6 +354,8 @@ def validate_model_input_dataset(dataset_path: Path):
             charges = list(dataset[species]["charges"][idx])[:natoms]
             positions = np.asarray(dataset[species]["positions"][idx])[:natoms]
             fragments = dataset[species]["fragments"][idx]
+            if isinstance(fragments, list):
+                fragment_counts[species].append(len(fragments))
 
             if positions.shape != (natoms, 3):
                 issues.append(
@@ -350,6 +409,17 @@ def validate_model_input_dataset(dataset_path: Path):
             f"{min(atom_counts)}/{np.median(atom_counts):.1f}/{max(atom_counts)}"
         )
     print(f"atomic_numbers={sorted(atomic_numbers)}")
+    print(
+        "single_fragment counts="
+        f"{dict((int(v), int(c)) for v, c in zip(*np.unique(dataset['single_fragment'], return_counts=True)))}"
+    )
+    for species in required_species:
+        if fragment_counts[species]:
+            values, counts = np.unique(fragment_counts[species], return_counts=True)
+            print(
+                f"{species}_fragment_counts="
+                f"{dict((int(v), int(c)) for v, c in zip(values, counts))}"
+            )
     print(f"max_abs_coord={max_abs_coord:.6g} max_molecular_span={max_span:.6g}")
     print(f"issues={len(issues)}")
     for issue in issues[:20]:
@@ -410,6 +480,29 @@ def write_filtered_dataset(raw_dataset, source_path: Path, output_dir: Path, max
     with open(filtered_path, "wb") as handle:
         pickle.dump(filtered, handle)
     return filtered_path, filtered
+
+
+def summarize_sample_geometry(dataset, dataset_index: int):
+    pieces = []
+    for species in ["reactant", "transition_state", "product"]:
+        data = dataset.raw_dataset[species]
+        natoms = int(data["num_atoms"][dataset_index])
+        positions = np.asarray(data["positions"][dataset_index])[:natoms]
+        centroid = positions.mean(axis=0)
+        centered = positions - centroid
+        if natoms > 1:
+            pairwise = positions[:, None, :] - positions[None, :, :]
+            distances = np.sqrt(np.sum(pairwise * pairwise, axis=-1))
+            distances[distances == 0] = np.inf
+            min_dist = float(np.min(distances))
+        else:
+            min_dist = float("nan")
+        pieces.append(
+            f"{species}: natoms={natoms} min_dist={min_dist:.4f} "
+            f"max_abs_centered={float(np.max(np.abs(centered))):.4f} "
+            f"span={float(np.ptp(positions, axis=0).max()):.4f}"
+        )
+    return " | ".join(pieces)
 
 
 def compute_selected_indices(raw_dataset, single_frag_only: bool, use_by_ind: bool):
@@ -644,6 +737,27 @@ def main():
                     break
 
                 batch_start = time.time()
+                if args.log_batches:
+                    current_batch_size = int(batch[0][0]["size"].size(0))
+                    batch_indices = [
+                        sample_offset + local_debug_idx
+                        for local_debug_idx in range(current_batch_size)
+                        if sample_offset + local_debug_idx < len(dataset)
+                    ]
+                    rxn_ids = [
+                        safe_value(dataset.raw_dataset["reactant"]["rxn"][dataset_index])
+                        for dataset_index in batch_indices
+                    ]
+                    print(
+                        f"[repeat {repeat_idx + 1}/{args.repeats}] "
+                        f"batch={batch_idx} starting dataset_indices={batch_indices} "
+                        f"rxn_ids={rxn_ids}"
+                    )
+                    for dataset_index in batch_indices:
+                        print(
+                            f"debug sample dataset_index={dataset_index} "
+                            f"{summarize_sample_geometry(dataset, dataset_index)}"
+                        )
                 out_samples, xh_fixed, fragments_nodes = inpaint_batch_local(
                     batch=batch,
                     ddpm_trainer=ddpm_trainer,
@@ -651,6 +765,40 @@ def main():
                     jump_length=args.jump_length,
                     frag_fixed=[0, 2],
                 )
+
+                if args.stop_on_nan:
+                    tensors_to_check = {
+                        "out_reactant": out_samples[0],
+                        "out_ts": out_samples[1],
+                        "out_product": out_samples[2],
+                        "fixed_reactant": xh_fixed[0],
+                        "fixed_ts": xh_fixed[1],
+                        "fixed_product": xh_fixed[2],
+                    }
+                    bad_tensors = [
+                        name
+                        for name, tensor in tensors_to_check.items()
+                        if not torch.isfinite(tensor).all()
+                    ]
+                    if bad_tensors:
+                        print(
+                            f"nonfinite tensors detected at repeat={repeat_idx} "
+                            f"batch={batch_idx}: {bad_tensors}"
+                        )
+                        current_batch_size = int(fragments_nodes[0].size(0))
+                        for local_debug_idx in range(current_batch_size):
+                            dataset_index = sample_offset + local_debug_idx
+                            if dataset_index >= len(dataset):
+                                continue
+                            rxn_id = safe_value(
+                                dataset.raw_dataset["reactant"]["rxn"][dataset_index]
+                            )
+                            print(
+                                f"debug sample local={local_debug_idx} "
+                                f"dataset_index={dataset_index} rxn={rxn_id} "
+                                f"{summarize_sample_geometry(dataset, dataset_index)}"
+                            )
+                        raise RuntimeError("Stopping because generated tensors contain NaN/Inf.")
 
                 split_fixed = split_by_sample(xh_fixed, fragments_nodes)
                 split_output = split_by_sample(out_samples, fragments_nodes)
