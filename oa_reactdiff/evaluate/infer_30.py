@@ -95,6 +95,15 @@ def parse_args():
         help="Limit the number of exported samples. Use -1 for all samples.",
     )
     parser.add_argument(
+        "--max-atoms",
+        default=-1,
+        type=int,
+        help=(
+            "Keep only reactions with at most this many atoms. "
+            "Use -1 to disable. The TS1x checkpoint was trained on <=23 atoms."
+        ),
+    )
+    parser.add_argument(
         "--num-workers",
         default=0,
         type=int,
@@ -349,6 +358,60 @@ def validate_model_input_dataset(dataset_path: Path):
         raise ValueError("Dataset validation failed.")
 
 
+def filter_dataset_by_max_atoms(raw_dataset, max_atoms: int):
+    if max_atoms <= 0:
+        return raw_dataset
+
+    keep_indices = [
+        idx
+        for idx, natoms in enumerate(raw_dataset["reactant"]["num_atoms"])
+        if int(natoms) <= max_atoms
+    ]
+    dropped = len(raw_dataset["single_fragment"]) - len(keep_indices)
+    if dropped == 0:
+        print(f"max_atoms_filter={max_atoms} kept all {len(keep_indices)} samples")
+        return raw_dataset
+
+    filtered = {}
+    for key, value in raw_dataset.items():
+        if key in ["reactant", "transition_state", "product"]:
+            filtered[key] = {
+                sub_key: [sub_value[idx] for idx in keep_indices]
+                for sub_key, sub_value in value.items()
+            }
+        elif key == "single_fragment":
+            filtered[key] = [value[idx] for idx in keep_indices]
+        elif key == "use_ind":
+            filtered[key] = list(range(len(keep_indices)))
+        else:
+            filtered[key] = value
+
+    print(
+        f"max_atoms_filter={max_atoms} kept={len(keep_indices)} "
+        f"dropped={dropped}"
+    )
+    if not keep_indices:
+        raise ValueError(
+            f"No samples remain after --max-atoms {max_atoms}. "
+            "This checkpoint was trained on smaller TS1x systems; use a checkpoint "
+            "trained for larger molecules or disable the filter and expect NaN risk."
+        )
+    return filtered
+
+
+def write_filtered_dataset(raw_dataset, source_path: Path, output_dir: Path, max_atoms: int):
+    filtered = filter_dataset_by_max_atoms(raw_dataset, max_atoms)
+    if filtered is raw_dataset:
+        return source_path, raw_dataset
+
+    filtered_dir = output_dir / "_filtered_inputs"
+    filtered_dir.mkdir(parents=True, exist_ok=True)
+    filtered_path = filtered_dir / f"{source_path.stem}_max_atoms_{max_atoms}.pkl"
+    with open(filtered_path, "wb") as handle:
+        pickle.dump(filtered, handle)
+    return filtered_path, filtered
+
+
 def compute_selected_indices(raw_dataset, single_frag_only: bool, use_by_ind: bool):
     if single_frag_only:
         single_frag_inds = np.where(np.array(raw_dataset["single_fragment"]) == 1)[0]
@@ -510,6 +573,12 @@ def main():
     save_true = bool(args.save_true)
 
     raw_dataset = load_pickle(dataset_path)
+    dataset_path, raw_dataset = write_filtered_dataset(
+        raw_dataset=raw_dataset,
+        source_path=dataset_path,
+        output_dir=output_dir,
+        max_atoms=args.max_atoms,
+    )
     selected_indices = compute_selected_indices(
         raw_dataset=raw_dataset,
         single_frag_only=single_frag_only,

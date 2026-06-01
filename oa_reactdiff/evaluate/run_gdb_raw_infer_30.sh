@@ -11,6 +11,7 @@ RESAMPLINGS="${RESAMPLINGS:-5}"
 JUMP_LENGTH="${JUMP_LENGTH:-5}"
 REPEATS="${REPEATS:-30}"
 NUM_WORKERS="${NUM_WORKERS:-0}"
+MAX_ATOMS="${MAX_ATOMS:--1}"
 
 python oa_reactdiff/evaluate/infer_30.py \
   --checkpoint "${CHECKPOINT}" \
@@ -23,6 +24,7 @@ python oa_reactdiff/evaluate/infer_30.py \
   --jump-length "${JUMP_LENGTH}" \
   --batch-size "${BATCH_SIZE}" \
   --num-workers "${NUM_WORKERS}" \
+  --max-atoms "${MAX_ATOMS}" \
   --device "${DEVICE}"
 
 python oa_reactdiff/evaluate/infer_30.py \
@@ -36,4 +38,5 @@ python oa_reactdiff/evaluate/infer_30.py \
   --jump-length "${JUMP_LENGTH}" \
   --batch-size "${BATCH_SIZE}" \
   --num-workers "${NUM_WORKERS}" \
+  --max-atoms "${MAX_ATOMS}" \
   --device "${DEVICE}"
