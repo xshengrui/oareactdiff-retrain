@@ -21,6 +21,7 @@ DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "outputs" / "xyz_from_ckpt"
 DEFAULT_CHECKPOINT_PATH = (
     PROJECT_ROOT / "oa_reactdiff" / "trainer" / "our_new_pretrained-ts1x-diff.ckpt"
 )
+RAW_TAR_CONVERTER_VERSION = 2
 ELEMENT_TO_ATOMIC_NUMBER = {
     "H": 1,
     "C": 6,
@@ -198,6 +199,7 @@ def build_dataset_from_raw_tar(tar_path: Path):
         "product": empty_fragment_dataset(),
         "single_fragment": [],
         "use_ind": list(range(len(complete_reactions))),
+        "raw_tar_converter_version": RAW_TAR_CONVERTER_VERSION,
     }
 
     for reaction_id in complete_reactions:
@@ -215,7 +217,7 @@ def build_dataset_from_raw_tar(tar_path: Path):
 
             dataset[species]["num_atoms"].append(natoms)
             dataset[species]["charges"].append(charges)
-            dataset[species]["fragments"].append([0] * natoms)
+            dataset[species]["fragments"].append([list(range(natoms))])
             dataset[species]["positions"].append(positions)
             dataset[species]["rxn"].append(reaction_id)
         dataset["single_fragment"].append(1)
@@ -233,6 +235,12 @@ def ensure_model_input_dataset(dataset_path: Path, output_dir: Path):
             not processed_path.exists()
             or processed_path.stat().st_mtime < dataset_path.stat().st_mtime
         )
+        if not needs_conversion:
+            cached_dataset = load_pickle(processed_path)
+            needs_conversion = (
+                cached_dataset.get("raw_tar_converter_version")
+                != RAW_TAR_CONVERTER_VERSION
+            )
         if needs_conversion:
             print(f"converting raw tar dataset to model input pkl: {processed_path}")
             dataset = build_dataset_from_raw_tar(dataset_path)
@@ -249,7 +257,7 @@ def ensure_model_input_dataset(dataset_path: Path, output_dir: Path):
 def validate_model_input_dataset(dataset_path: Path):
     dataset = load_pickle(dataset_path)
     required_species = ["reactant", "transition_state", "product"]
-    required_keys = ["num_atoms", "charges", "positions", "rxn"]
+    required_keys = ["num_atoms", "charges", "fragments", "positions", "rxn"]
 
     sample_count = len(dataset["single_fragment"])
     issues = []
@@ -279,6 +287,7 @@ def validate_model_input_dataset(dataset_path: Path):
             natoms = int(dataset[species]["num_atoms"][idx])
             charges = list(dataset[species]["charges"][idx])[:natoms]
             positions = np.asarray(dataset[species]["positions"][idx])[:natoms]
+            fragments = dataset[species]["fragments"][idx]
 
             if positions.shape != (natoms, 3):
                 issues.append(
@@ -292,6 +301,17 @@ def validate_model_input_dataset(dataset_path: Path):
                     f"charge length mismatch at sample={idx} species={species}: "
                     f"{len(charges)}, natoms={natoms}"
                 )
+            if not isinstance(fragments, list) or not fragments:
+                issues.append(f"bad fragments at sample={idx} species={species}")
+            else:
+                flattened_fragments = [
+                    atom_index for fragment in fragments for atom_index in fragment
+                ]
+                if sorted(flattened_fragments) != list(range(natoms)):
+                    issues.append(
+                        f"fragments do not cover atoms at sample={idx} "
+                        f"species={species}"
+                    )
             unsupported = sorted(set(charges) - set(ELEMENT_TO_ATOMIC_NUMBER.values()))
             if unsupported:
                 issues.append(
