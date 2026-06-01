@@ -67,12 +67,15 @@ def parse_args():
         help='Device to use: "auto", "cuda", or "cpu".',
     )
     parser.add_argument("--batch-size", default=8, type=int, help="Batch size for inference.")
-    parser.add_argument("--timesteps", default=250, type=int, help="Diffusion timesteps.")
+    parser.add_argument("--timesteps", default=150, type=int, help="Diffusion timesteps.")
     parser.add_argument(
         "--noise-schedule",
-        default="cosine",
+        default="polynomial_2",
         type=str,
-        help="Noise schedule used for inference. Defaults to cosine to match this checkpoint.",
+        help=(
+            "Noise schedule used for inference. Defaults to polynomial_2, "
+            "matching DDPMModule.sampling_schedule and the original eval utilities."
+        ),
     )
     parser.add_argument("--resamplings", default=5, type=int, help="RePaint resamplings.")
     parser.add_argument("--jump-length", default=5, type=int, help="RePaint jump length.")
