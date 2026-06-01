@@ -135,12 +135,30 @@ class EGNNDynamics(BaseDynamics):
             subgraph_mask=subgraph_mask[:, None],
         )
         vel = pos_final - pos
-        if torch.any(torch.isnan(vel)):
-            print("Warning: detected nan in pos, resetting EGNN output to randn.")
-            vel = torch.randn_like(vel)
-        if torch.any(torch.isnan(vel)):
-            print("Warning: detected nan in h, resetting EGNN output to randn.")
-            h_final = torch.randn_like(h_final)
+        if not torch.isfinite(vel).all():
+            nan_policy = getattr(self, "nan_policy", "randn")
+            if nan_policy == "error":
+                raise FloatingPointError("Detected NaN/Inf in EGNN position update.")
+            if nan_policy == "zero":
+                if not getattr(self, "silent_nan", False):
+                    print("Warning: detected nan in pos, resetting EGNN output to zeros.")
+                vel = torch.nan_to_num(vel, nan=0.0, posinf=0.0, neginf=0.0)
+            else:
+                if not getattr(self, "silent_nan", False):
+                    print("Warning: detected nan in pos, resetting EGNN output to randn.")
+                vel = torch.randn_like(vel)
+        if not torch.isfinite(h_final).all():
+            nan_policy = getattr(self, "nan_policy", "randn")
+            if nan_policy == "error":
+                raise FloatingPointError("Detected NaN/Inf in EGNN feature update.")
+            if nan_policy == "zero":
+                if not getattr(self, "silent_nan", False):
+                    print("Warning: detected nan in h, resetting EGNN output to zeros.")
+                h_final = torch.nan_to_num(h_final, nan=0.0, posinf=0.0, neginf=0.0)
+            else:
+                if not getattr(self, "silent_nan", False):
+                    print("Warning: detected nan in h, resetting EGNN output to randn.")
+                h_final = torch.randn_like(h_final)
 
         h_final = h_final[:, :-condition_dim]
 
