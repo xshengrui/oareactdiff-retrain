@@ -1,5 +1,6 @@
 from typing import List, Optional, Tuple
 from uuid import uuid4
+import argparse
 import os
 import shutil
 import torch
@@ -14,7 +15,6 @@ from pytorch_lightning.callbacks import (
 )
 from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.strategies.ddp import DDPStrategy
-from pytorch_lightning.strategies.ddp import DDPStrategy
 
 from oa_reactdiff.trainer.ema import EMACallback
 from oa_reactdiff.model import EGNN, LEFTNet
@@ -26,9 +26,65 @@ import wandb
 wandb.init(mode="offline")
 
 
+def parse_args():
+    parser = argparse.ArgumentParser()
+
+    def str2bool(value):
+        value = value.lower()
+        if value in {"1", "true", "yes", "y", "on"}:
+            return True
+        if value in {"0", "false", "no", "n", "off"}:
+            return False
+        raise argparse.ArgumentTypeError(f"expected boolean value, got {value}")
+
+    parser.add_argument("--datadir", type=str, default=None)
+    parser.add_argument("--bz", type=int, default=None)
+    parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--num_workers", type=int, default=None)
+    parser.add_argument("--save_every", type=int, default=None)
+    parser.add_argument(
+        "--val_sampling_mode",
+        choices=["first_batch", "all", "none"],
+        default=None,
+    )
+    parser.add_argument("--single_frag_only", type=str2bool, default=None)
+    parser.add_argument("--use_by_ind", type=str2bool, default=None)
+    parser.add_argument("--devices", type=int, default=None)
+    parser.add_argument("--num_nodes", type=int, default=None)
+    parser.add_argument("--max_epochs", type=int, default=2000)
+    parser.add_argument("--accumulate_grad_batches", type=int, default=1)
+    parser.add_argument("--gradient_clip_val", type=float)
+    parser.add_argument("--project", type=str, default=None)
+    parser.add_argument("--run_name", type=str, default=None)
+    return parser.parse_args()
+
+
+def resolve_trainer_runtime(args):
+    cuda_devices = torch.cuda.device_count()
+    launched_with_torchrun = "LOCAL_RANK" in os.environ
+    num_nodes = args.num_nodes or int(os.environ.get("PET_NNODES", os.environ.get("NNODES", "1")))
+
+    if cuda_devices > 0:
+        accelerator = "gpu"
+        devices = 1 if launched_with_torchrun else (args.devices or cuda_devices)
+        if launched_with_torchrun or devices > 1 or num_nodes > 1:
+            strategy = DDPStrategy(find_unused_parameters=True)
+        else:
+            strategy = None
+    else:
+        accelerator = "cpu"
+        devices = 1
+        strategy = None
+
+    return accelerator, devices, num_nodes, strategy, cuda_devices, launched_with_torchrun
+
+
+args = parse_args()
+
+
 model_type = "leftnet"
 version = "0"
-project = "OAReactDiff"
+project = args.project or "OAReactDiff"
 
 # ---EGNNDynamics---
 egnn_config = dict(
@@ -82,9 +138,9 @@ optimizer_config = dict(
 T_0 = 200
 T_mult = 2
 training_config = dict(
-    datadir="../data/data_new_split/",
+    datadir=args.datadir or "../../data/transition1x_rebuild/",
     remove_h=False,
-    bz=32,
+    bz=64,
     num_workers=6,       #建议值不一定需要改
     clip_grad=True,
     gradient_clip_val=None,
@@ -92,10 +148,11 @@ training_config = dict(
     ema_decay=0.999,
     swapping_react_prod=True,
     append_frag=False,
-    use_by_ind=True,
+    use_by_ind=False,
     reflection=False,
-    single_frag_only=True,
+    single_frag_only=False,
     only_ts=False,
+    val_sampling_mode="all",  # "first_batch", "all", or "none"
     lr_schedule_type=None,
     lr_schedule_config=dict(
         gamma=0.8,
@@ -119,6 +176,22 @@ enforce_same_encoding = None
 scales = [1.0, 2.0, 1.0]
 fixed_idx: Optional[List] = None
 eval_epochs = 10
+save_every = args.save_every or 10
+
+if args.bz is not None:
+    training_config["bz"] = args.bz
+if args.num_workers is not None:
+    training_config["num_workers"] = args.num_workers
+if args.gradient_clip_val is not None:
+    training_config["gradient_clip_val"] = args.gradient_clip_val
+if args.single_frag_only is not None:
+    training_config["single_frag_only"] = args.single_frag_only
+if args.use_by_ind is not None:
+    training_config["use_by_ind"] = args.use_by_ind
+if args.val_sampling_mode is not None:
+    training_config["val_sampling_mode"] = args.val_sampling_mode
+if args.lr is not None:
+    optimizer_config["lr"] = args.lr
 
 # ----Normalizer---
 norm_values: Tuple = (1.0, 1.0, 1.0)
@@ -130,7 +203,7 @@ timesteps: int = 5000
 precision: float = 1e-5
 
 norms = "_".join([str(x) for x in norm_values])
-run_name = f"{model_type}-{version}-" + str(uuid4()).split("-")[-1]
+run_name = args.run_name or f"{model_type}-{version}-" + str(uuid4()).split("-")[-1]
 
 seed_everything(42, workers=True)
 ddpm = DDPMModule(
@@ -184,13 +257,25 @@ earlystopping = EarlyStopping(
     verbose=True,
     log_rank_zero_only=True,
 )
-checkpoint_callback = ModelCheckpoint(
-    monitor="val-totloss",
-    dirpath=ckpt_path,
-    filename="ddpm-{epoch:03d}-{val-totloss:.2f}",
-    every_n_epochs=1,
-    save_top_k=-1,
-)
+full_val_sampling = training_config.get("val_sampling_mode") == "all"
+if full_val_sampling:
+    checkpoint_callback = ModelCheckpoint(
+        monitor="val-rmsd-median",
+        mode="min",
+        dirpath=ckpt_path,
+        filename="ddpm-{epoch:03d}-{val-rmsd-median:.4f}",
+        every_n_epochs=save_every,
+        save_top_k=1,
+        save_last=False,
+    )
+else:
+    checkpoint_callback = ModelCheckpoint(
+        dirpath=ckpt_path,
+        filename="ddpm-{epoch:03d}",
+        every_n_epochs=save_every,
+        save_top_k=0,
+        save_last=True,
+    )
 lr_monitor = LearningRateMonitor(logging_interval="step")
 callbacks = [earlystopping, checkpoint_callback, TQDMProgressBar(), lr_monitor]
 if training_config["ema"]:
@@ -202,35 +287,48 @@ shutil.copy(f"../model/{model_type}.py", f"{ckpt_path}/{model_type}.py")
 
 print("config: ", config)
 
-strategy = None
-devices = [0]
-strategy = DDPStrategy(find_unused_parameters=True)
-if strategy is not None:
-    devices = list(range(torch.cuda.device_count()))
-if len(devices) == 1:
-    strategy = None
-    
-# devices = [0,1,2,3]
-# strategy = DDPStrategy(find_unused_parameters=True)
-    
+(
+    accelerator,
+    devices,
+    num_nodes,
+    strategy,
+    cuda_devices,
+    launched_with_torchrun,
+) = resolve_trainer_runtime(args)
+
+print(
+    "trainer devices: "
+    f"accelerator={accelerator}, devices={devices}, num_nodes={num_nodes}, "
+    f"strategy={strategy.__class__.__name__ if strategy is not None else None}, "
+    f"visible_cuda_devices={cuda_devices}, torchrun={launched_with_torchrun}"
+)
+
 trainer = Trainer(
-    max_epochs=2000,
-    accelerator="gpu",
+    max_epochs=args.max_epochs,
+    accelerator=accelerator,
     deterministic=False,
     devices=devices,
+    num_nodes=num_nodes,
     strategy=strategy,
     log_every_n_steps=1,
     callbacks=callbacks,
     profiler=None,
     logger=wandb_logger,
-    accumulate_grad_batches=1,
+    accumulate_grad_batches=args.accumulate_grad_batches,
     gradient_clip_val=training_config["gradient_clip_val"],
-    limit_train_batches=200,
-    limit_val_batches=20,
     # max_time="00:10:00:00",
 )
 
 trainer.fit(ddpm)
-# trainer.fit(ddpm, ckpt_path="/inspire/qb-ilm/project/chemicalreaction/czxs25220150/projects/OAReactDiff/oa_reactdiff/trainer/checkpoint/OAReactDiff/leftnet-0-357273014755/ddpm-epoch=445-val-totloss=579.44.ckpt")
+# trainer.fit(ddpm, ckpt_path="<path-to-resume-checkpoint>")
 
-trainer.save_checkpoint("our_new_pretrained-ts1x-diff.ckpt")
+final_ckpt_path = "our_new_pretrained-ts1x-diff.ckpt"
+if full_val_sampling and checkpoint_callback.best_model_path:
+    shutil.copyfile(checkpoint_callback.best_model_path, final_ckpt_path)
+    print(
+        "Saved final checkpoint from best validation sampling median RMSD: "
+        f"{checkpoint_callback.best_model_path} -> {final_ckpt_path}"
+    )
+else:
+    trainer.save_checkpoint(final_ckpt_path)
+    print(f"Saved final checkpoint from the last training state: {final_ckpt_path}")

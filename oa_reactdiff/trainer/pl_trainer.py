@@ -139,6 +139,13 @@ class DDPMModule(LightningModule):
             norm_values=norm_values,
         )
         self.eval_epochs = eval_epochs
+        self.val_sampling_mode = training_config.get("val_sampling_mode", "first_batch")
+        allowed_val_sampling_modes = {"first_batch", "all", "none"}
+        if self.val_sampling_mode not in allowed_val_sampling_modes:
+            raise ValueError(
+                "val_sampling_mode should be one of "
+                f"{sorted(allowed_val_sampling_modes)}, got {self.val_sampling_mode}"
+            )
 
         self.clip_grad = training_config["clip_grad"]
         if self.clip_grad:
@@ -324,6 +331,18 @@ class DDPMModule(LightningModule):
         )
         return np.mean(rmsds), np.median(rmsds)
 
+    def _is_sampling_epoch(self):
+        return (self.current_epoch + 1) % self.eval_epochs == 0
+
+    def _should_sample_validation_batch(self, batch_idx):
+        if not self._is_sampling_epoch():
+            return False
+        if self.val_sampling_mode == "none":
+            return False
+        if self.val_sampling_mode == "all":
+            return True
+        return batch_idx == 0
+
     def training_step(self, batch, batch_idx):
         nll, info = self.compute_loss(batch)
         loss = nll.mean(0)
@@ -332,10 +351,10 @@ class DDPMModule(LightningModule):
         for k, v in info.items():
             self.log(f"train-{k}", v, rank_zero_only=True)
 
-        if (self.current_epoch + 1) % self.eval_epochs == 0 and batch_idx == 0:
+        if self._is_sampling_epoch() and batch_idx == 0:
             if self.trainer.is_global_zero:
                 print(
-                    "evaluation on samping for training batch...",
+                    "evaluation on sampling for training batch...",
                     batch[1].shape,
                     batch_idx,
                 )
@@ -351,10 +370,10 @@ class DDPMModule(LightningModule):
         loss = nll.mean(0)
         info["totloss"] = loss.item()
 
-        if (self.current_epoch + 1) % self.eval_epochs == 0 and batch_idx == 0:
+        if self._should_sample_validation_batch(batch_idx):
             if self.trainer.is_global_zero:
                 print(
-                    "evaluation on samping for validation batch...",
+                    "evaluation on sampling for validation batch...",
                     batch[1].shape,
                     batch_idx,
                 )
