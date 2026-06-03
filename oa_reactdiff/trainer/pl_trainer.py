@@ -354,17 +354,6 @@ class DDPMModule(LightningModule):
         for k, v in info.items():
             self.log(f"train-{k}", v, rank_zero_only=True)
 
-        if self._is_sampling_epoch() and batch_idx == 0:
-            if self.trainer.is_global_zero:
-                print(
-                    "evaluation on sampling for training batch...",
-                    batch[1].shape,
-                    batch_idx,
-                )
-            rmsd_mean, rmsd_median = self.eval_inplaint_batch(batch)
-            info["rmsd"], info["rmsd-median"] = rmsd_mean, rmsd_median
-        else:
-            info["rmsd"], info["rmsd-median"] = np.nan, np.nan
         info["loss"] = loss
         return info
 
@@ -374,12 +363,6 @@ class DDPMModule(LightningModule):
         info["totloss"] = loss.item()
 
         if self._should_sample_validation_batch(batch_idx):
-            if self.trainer.is_global_zero:
-                print(
-                    "evaluation on sampling for validation batch...",
-                    batch[1].shape,
-                    batch_idx,
-                )
             info["rmsd"], info["rmsd-median"] = self.eval_inplaint_batch(batch)
         else:
             info["rmsd"], info["rmsd-median"] = np.nan, np.nan
@@ -402,13 +385,6 @@ class DDPMModule(LightningModule):
         val_epoch_metrics.update({"epoch": self.current_epoch})
         for k, v in val_epoch_metrics.items():
             self.log(k, v, sync_dist=True)
-
-    def training_epoch_end(self, outputs) -> None:
-        epoch_metrics = average_over_batch_metrics(
-            outputs, allowed=["rmsd", "rmsd-median"]
-        )
-        self.log("train-rmsd", epoch_metrics["rmsd"], sync_dist=True)
-        self.log("train-rmsd-median", epoch_metrics["rmsd-median"], sync_dist=True)
 
     def configure_gradient_clipping(
         self, optimizer, optimizer_idx, gradient_clip_val, gradient_clip_algorithm
