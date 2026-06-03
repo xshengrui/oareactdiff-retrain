@@ -332,7 +332,7 @@ class DDPMModule(LightningModule):
             idx=1,
             threshold=0.5,
         )
-        return np.mean(rmsds), np.median(rmsds)
+        return torch.tensor(rmsds, device=self.device, dtype=torch.float32)
 
     def _is_sampling_epoch(self):
         return (self.current_epoch + 1) % self.eval_epochs == 0
@@ -363,7 +363,9 @@ class DDPMModule(LightningModule):
         info["totloss"] = loss.item()
 
         if self._should_sample_validation_batch(batch_idx):
-            info["rmsd"], info["rmsd-median"] = self.eval_inplaint_batch(batch)
+            rmsds = self.eval_inplaint_batch(batch)
+            info["rmsd"], info["rmsd-median"] = rmsds.mean(), rmsds.median()
+            info["rmsds"] = rmsds.detach()
         else:
             info["rmsd"], info["rmsd-median"] = np.nan, np.nan
 
@@ -379,10 +381,21 @@ class DDPMModule(LightningModule):
         return self._shared_eval(batch, batch_idx, "test", *args)
 
     def validation_epoch_end(self, val_step_outputs):
+        sampled_rmsds = [
+            out.pop("val-rmsds")
+            for out in val_step_outputs
+            if "val-rmsds" in out and out["val-rmsds"].numel() > 0
+        ]
         val_epoch_metrics = average_over_batch_metrics(val_step_outputs)
+        if sampled_rmsds:
+            local_rmsds = torch.cat(sampled_rmsds)
+            if self.trainer.world_size > 1:
+                local_rmsds = self.all_gather(local_rmsds).reshape(-1)
+            val_epoch_metrics["val-rmsd"] = local_rmsds.mean()
+            val_epoch_metrics["val-rmsd-median"] = local_rmsds.median()
         if self.trainer.is_global_zero:
             pretty_print(self.current_epoch, val_epoch_metrics, prefix="val")
-        val_epoch_metrics.update({"epoch": self.current_epoch})
+        val_epoch_metrics.update({"epoch": float(self.current_epoch)})
         for k, v in val_epoch_metrics.items():
             self.log(k, v, sync_dist=True)
 
@@ -633,7 +646,7 @@ class ConfModule(LightningModule):
         val_epoch_metrics = average_over_batch_metrics(val_step_outputs)
         if self.trainer.is_global_zero:
             pretty_print(self.current_epoch, val_epoch_metrics, prefix="val")
-        val_epoch_metrics.update({"epoch": self.current_epoch})
+        val_epoch_metrics.update({"epoch": float(self.current_epoch)})
         for k, v in val_epoch_metrics.items():
             self.log(k, v, sync_dist=True)
 

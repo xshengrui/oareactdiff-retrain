@@ -104,8 +104,12 @@ def resolve_run_name(args, model_type, version):
     return run_name
 
 
+def get_process_rank():
+    return int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
+
+
 def prepare_run_dirs(run_dir, ckpt_path, log_path, allow_existing_run_dir):
-    rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
+    rank = get_process_rank()
     run_dir = str(run_dir)
     created_by_parent = os.environ.get("OA_REACTDIFF_RUN_DIR") == run_dir
 
@@ -293,9 +297,12 @@ run_dir = REPO_ROOT / "checkpoint" / project / run_name
 ckpt_path = run_dir / "ckpts"
 log_path = run_dir / "logs"
 prepare_run_dirs(run_dir, ckpt_path, log_path, args.allow_existing_run_dir)
-if int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0"))) == 0:
+process_rank = get_process_rank()
+if process_rank == 0:
     with open(run_dir / "config.json", "w", encoding="utf-8") as config_file:
         json.dump(config, config_file, indent=2, sort_keys=True)
+else:
+    os.environ["WANDB_MODE"] = "disabled"
 trainer = None
 if trainer is None or (isinstance(trainer, Trainer) and trainer.is_global_zero):
     wandb_logger = WandbLogger(
@@ -304,11 +311,12 @@ if trainer is None or (isinstance(trainer, Trainer) and trainer.is_global_zero):
         name=run_name,
         save_dir=str(log_path),
     )
-    try:  # Avoid errors for creating wandb instances multiple times
-        wandb_logger.experiment.config.update(config)
-        wandb_logger.watch(ddpm.ddpm.dynamics, log="all", log_freq=100, log_graph=False)
-    except:
-        pass
+    if process_rank == 0:
+        try:  # Avoid errors for creating wandb instances multiple times
+            wandb_logger.experiment.config.update(config)
+            wandb_logger.watch(ddpm.ddpm.dynamics, log="all", log_freq=100, log_graph=False)
+        except:
+            pass
 
 earlystopping = EarlyStopping(
     monitor="val-totloss",
@@ -369,6 +377,7 @@ trainer = Trainer(
     callbacks=callbacks,
     profiler=None,
     logger=wandb_logger,
+    num_sanity_val_steps=0,
     accumulate_grad_batches=args.accumulate_grad_batches,
     gradient_clip_val=training_config["gradient_clip_val"],
     # max_time="00:10:00:00",
