@@ -1,10 +1,15 @@
 from typing import List, Optional, Tuple
 from uuid import uuid4
 import argparse
+import json
 import os
 import shutil
 import time
+from pathlib import Path
 import torch
+
+if hasattr(torch, "set_float32_matmul_precision"):
+    torch.set_float32_matmul_precision("high")
 
 from pl_trainer import DDPMModule
 from pytorch_lightning import Trainer, seed_everything
@@ -22,6 +27,7 @@ from oa_reactdiff.model import EGNN, LEFTNet
 
 
 os.environ.setdefault("WANDB_MODE", "offline")
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def parse_args():
@@ -36,6 +42,9 @@ def parse_args():
         raise argparse.ArgumentTypeError(f"expected boolean value, got {value}")
 
     parser.add_argument("--datadir", type=str, default=None)
+    parser.add_argument("--train_file", type=str, default=None)
+    parser.add_argument("--val_file", type=str, default=None)
+    parser.add_argument("--test_file", type=str, default=None)
     parser.add_argument("--bz", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--num_workers", type=int, default=None)
@@ -65,7 +74,7 @@ def resolve_trainer_runtime(args):
 
     if cuda_devices > 0:
         accelerator = "gpu"
-        devices = 1 if launched_with_torchrun else (args.devices or cuda_devices)
+        devices = args.devices or cuda_devices
         if launched_with_torchrun or devices > 1 or num_nodes > 1:
             strategy = DDPStrategy(find_unused_parameters=True)
         else:
@@ -97,6 +106,7 @@ def resolve_run_name(args, model_type, version):
 
 def prepare_run_dirs(run_dir, ckpt_path, log_path, allow_existing_run_dir):
     rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
+    run_dir = str(run_dir)
     created_by_parent = os.environ.get("OA_REACTDIFF_RUN_DIR") == run_dir
 
     if rank == 0:
@@ -177,7 +187,10 @@ optimizer_config = dict(
 T_0 = 200
 T_mult = 2
 training_config = dict(
-    datadir=args.datadir or "../../data/transition1x_rebuild/",
+    datadir=args.datadir or str(REPO_ROOT / "data" / "transition1x_rebuild"),
+    train_file=args.train_file or "train.pkl",
+    val_file=args.val_file or "val.pkl",
+    test_file=args.test_file or "test.pkl",
     remove_h=False,
     bz=64,
     num_workers=6,       #建议值不一定需要改
@@ -276,17 +289,20 @@ ddpm = DDPMModule(
 config = model_config.copy()
 config.update(optimizer_config)
 config.update(training_config)
-run_dir = os.path.join("checkpoint", project, run_name)
-ckpt_path = os.path.join(run_dir, "ckpts")
-log_path = os.path.join(run_dir, "logs")
+run_dir = REPO_ROOT / "checkpoint" / project / run_name
+ckpt_path = run_dir / "ckpts"
+log_path = run_dir / "logs"
 prepare_run_dirs(run_dir, ckpt_path, log_path, args.allow_existing_run_dir)
+if int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0"))) == 0:
+    with open(run_dir / "config.json", "w", encoding="utf-8") as config_file:
+        json.dump(config, config_file, indent=2, sort_keys=True)
 trainer = None
 if trainer is None or (isinstance(trainer, Trainer) and trainer.is_global_zero):
     wandb_logger = WandbLogger(
         project=project,
         log_model=False,
         name=run_name,
-        save_dir=log_path,
+        save_dir=str(log_path),
     )
     try:  # Avoid errors for creating wandb instances multiple times
         wandb_logger.experiment.config.update(config)
@@ -305,7 +321,7 @@ if full_val_sampling:
     checkpoint_callback = ModelCheckpoint(
         monitor="val-rmsd-median",
         mode="min",
-        dirpath=ckpt_path,
+        dirpath=str(ckpt_path),
         filename="ddpm-{epoch:03d}-{val-rmsd-median:.4f}",
         every_n_epochs=save_every,
         save_top_k=1,
@@ -313,7 +329,7 @@ if full_val_sampling:
     )
 else:
     checkpoint_callback = ModelCheckpoint(
-        dirpath=ckpt_path,
+        dirpath=str(ckpt_path),
         filename="ddpm-{epoch:03d}",
         every_n_epochs=save_every,
         save_top_k=0,
@@ -323,8 +339,6 @@ lr_monitor = LearningRateMonitor(logging_interval="step")
 callbacks = [earlystopping, checkpoint_callback, TQDMProgressBar(), lr_monitor]
 if training_config["ema"]:
     callbacks.append(EMACallback(decay=training_config["ema_decay"]))
-
-shutil.copy(f"../model/{model_type}.py", os.path.join(run_dir, f"{model_type}.py"))
 
 print("config: ", config)
 
@@ -364,7 +378,7 @@ trainer.fit(ddpm)
 # trainer.fit(ddpm, ckpt_path="<path-to-resume-checkpoint>")
 
 if full_val_sampling and checkpoint_callback.best_model_path:
-    final_ckpt_path = os.path.join(ckpt_path, "best.ckpt")
+    final_ckpt_path = ckpt_path / "best.ckpt"
     shutil.copyfile(checkpoint_callback.best_model_path, final_ckpt_path)
     print(
         "Saved final checkpoint from best validation sampling median RMSD: "

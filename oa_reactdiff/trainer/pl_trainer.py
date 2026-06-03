@@ -168,18 +168,21 @@ class DDPMModule(LightningModule):
         func = PROCESS_FUNC[self.process_type]
         ft = FILE_TYPE[self.process_type]
         if stage == "fit":
+            train_file = self.training_config.get("train_file", "train_rpsb_all.pkl")
+            val_file = self.training_config.get("val_file", "valid_rpsb_all.pkl")
             self.train_dataset = func(
-                Path(self.training_config["datadir"], "train_rpsb_all.pkl"),
+                Path(self.training_config["datadir"], train_file),
                 **self.training_config,
             )
             self.training_config["reflection"] = False  # Turn off reflection in val.
             self.val_dataset = func(
-                Path(self.training_config["datadir"], "valid_rpsb_all.pkl"),
+                Path(self.training_config["datadir"], val_file),
                 **self.training_config,
             )
         elif stage == "test":
+            test_file = self.training_config.get("test_file", "test.pkl")
             self.test_dataset = func(
-                Path(self.training_config["datadir"], "test.pkl"),
+                Path(self.training_config["datadir"], test_file),
                 **self.training_config,
             )
         else:
