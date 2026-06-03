@@ -6,6 +6,7 @@ from uuid import uuid4
 import argparse
 import os
 import shutil
+import time
 
 import torch
 
@@ -79,6 +80,46 @@ def resolve_trainer_runtime(args):
         strategy = None
 
     return accelerator, devices, num_nodes, strategy, cuda_devices, launched_with_torchrun
+
+
+def resolve_run_name(args, model_type, version):
+    env_run_name = os.environ.get("OA_REACTDIFF_RUN_NAME")
+    if args.run_name:
+        run_name = args.run_name
+    elif env_run_name:
+        run_name = env_run_name
+    else:
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        if world_size > 1 or "RANK" in os.environ or "LOCAL_RANK" in os.environ:
+            raise ValueError(
+                "Distributed launches require a shared --run_name or OA_REACTDIFF_RUN_NAME."
+            )
+        run_name = f"{model_type}-{version}-" + str(uuid4()).split("-")[-1]
+    os.environ["OA_REACTDIFF_RUN_NAME"] = run_name
+    return run_name
+
+
+def prepare_run_dirs(run_dir, ckpt_path, log_path, allow_existing_run_dir):
+    rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
+    created_by_parent = os.environ.get("OA_REACTDIFF_RUN_DIR") == run_dir
+
+    if rank == 0:
+        if os.path.exists(run_dir) and not allow_existing_run_dir and not created_by_parent:
+            raise FileExistsError(
+                f"Run directory already exists: {run_dir}. "
+                "Use a new --run_name or pass --allow_existing_run_dir true to reuse it."
+            )
+        os.makedirs(ckpt_path, exist_ok=True)
+        os.makedirs(log_path, exist_ok=True)
+        os.environ["OA_REACTDIFF_RUN_DIR"] = run_dir
+        return
+
+    deadline = time.time() + 300
+    while not (os.path.isdir(ckpt_path) and os.path.isdir(log_path)):
+        if time.time() > deadline:
+            raise TimeoutError(f"Timed out waiting for rank 0 to create {run_dir}")
+        time.sleep(1)
+    os.environ["OA_REACTDIFF_RUN_DIR"] = run_dir
 
 
 args = parse_args()
@@ -206,7 +247,7 @@ timesteps: int = 5000
 precision: float = 1e-5
 
 norms = "_".join([str(x) for x in norm_values])
-run_name = args.run_name or f"{model_type}-{version}-" + str(uuid4()).split("-")[-1]
+run_name = resolve_run_name(args, model_type, version)
 
 seed_everything(42, workers=True)
 ddpm = DDPMModule(
@@ -243,13 +284,7 @@ config.update(training_config)
 run_dir = os.path.join("checkpoint", project, run_name)
 ckpt_path = os.path.join(run_dir, "ckpts")
 log_path = os.path.join(run_dir, "logs")
-if os.path.exists(run_dir) and not args.allow_existing_run_dir:
-    raise FileExistsError(
-        f"Run directory already exists: {run_dir}. "
-        "Use a new --run_name or pass --allow_existing_run_dir true to reuse it."
-    )
-os.makedirs(ckpt_path, exist_ok=True)
-os.makedirs(log_path, exist_ok=True)
+prepare_run_dirs(run_dir, ckpt_path, log_path, args.allow_existing_run_dir)
 trainer = None
 if trainer is None or (isinstance(trainer, Trainer) and trainer.is_global_zero):
     wandb_logger = WandbLogger(
