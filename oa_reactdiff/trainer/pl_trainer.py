@@ -364,7 +364,8 @@ class DDPMModule(LightningModule):
 
         if self._should_sample_validation_batch(batch_idx):
             rmsds = self.eval_inplaint_batch(batch)
-            info["rmsd"], info["rmsd-median"] = rmsds.mean(), rmsds.median()
+            info["rmsd"] = rmsds.mean().detach().cpu().item()
+            info["rmsd-median"] = rmsds.median().detach().cpu().item()
             info["rmsds"] = rmsds.detach()
         else:
             info["rmsd"], info["rmsd-median"] = np.nan, np.nan
@@ -391,8 +392,10 @@ class DDPMModule(LightningModule):
             local_rmsds = torch.cat(sampled_rmsds)
             if self.trainer.world_size > 1:
                 local_rmsds = self.all_gather(local_rmsds).reshape(-1)
-            val_epoch_metrics["val-rmsd"] = local_rmsds.mean()
-            val_epoch_metrics["val-rmsd-median"] = local_rmsds.median()
+            val_epoch_metrics["val-rmsd"] = local_rmsds.mean().detach().cpu().item()
+            val_epoch_metrics["val-rmsd-median"] = (
+                local_rmsds.median().detach().cpu().item()
+            )
         if self.trainer.is_global_zero:
             pretty_print(self.current_epoch, val_epoch_metrics, prefix="val")
         val_epoch_metrics.update({"epoch": float(self.current_epoch)})

@@ -10,13 +10,19 @@ def average_over_batch_metrics(batch_metrics: List[Dict], allowed: List = []):
         for k, v in out.items():
             if not (k in allowed or len(allowed) == 0):
                 continue
-            if ii == 0:
+            if isinstance(v, torch.Tensor):
+                if v.numel() != 1 or torch.isnan(v.detach()).any().item():
+                    continue
+                v = v.detach().cpu().item()
+            elif np.isnan(v):
+                continue
+
+            if k not in epoch_metrics:
                 epoch_metrics[k] = v
                 effective_batch[k] = 1
             else:
-                if not np.isnan(v):
-                    epoch_metrics[k] += v
-                    effective_batch[k] += 1
+                epoch_metrics[k] += v
+                effective_batch[k] += 1
     for k in epoch_metrics:
         epoch_metrics[k] /= effective_batch[k]
     return epoch_metrics
