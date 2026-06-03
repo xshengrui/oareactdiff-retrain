@@ -24,10 +24,7 @@ from oa_reactdiff.trainer.ema import EMACallback
 from oa_reactdiff.model import EGNN, LEFTNet
 
 
-import wandb
-
-# 设置离线模式
-wandb.init(mode="offline")
+os.environ.setdefault("WANDB_MODE", "offline")
 
 
 def parse_args():
@@ -60,6 +57,7 @@ def parse_args():
     parser.add_argument("--gradient_clip_val", type=float)
     parser.add_argument("--project", type=str, default=None)
     parser.add_argument("--run_name", type=str, default=None)
+    parser.add_argument("--allow_existing_run_dir", type=str2bool, default=False)
     return parser.parse_args()
 
 
@@ -242,12 +240,23 @@ ddpm = DDPMModule(
 config = model_config.copy()
 config.update(optimizer_config)
 config.update(training_config)
+run_dir = os.path.join("checkpoint", project, run_name)
+ckpt_path = os.path.join(run_dir, "ckpts")
+log_path = os.path.join(run_dir, "logs")
+if os.path.exists(run_dir) and not args.allow_existing_run_dir:
+    raise FileExistsError(
+        f"Run directory already exists: {run_dir}. "
+        "Use a new --run_name or pass --allow_existing_run_dir true to reuse it."
+    )
+os.makedirs(ckpt_path, exist_ok=True)
+os.makedirs(log_path, exist_ok=True)
 trainer = None
 if trainer is None or (isinstance(trainer, Trainer) and trainer.is_global_zero):
     wandb_logger = WandbLogger(
         project=project,
         log_model=False,
         name=run_name,
+        save_dir=log_path,
     )
     try:  # Avoid errors for creating wandb instances multiple times
         wandb_logger.experiment.config.update(config)
@@ -255,7 +264,6 @@ if trainer is None or (isinstance(trainer, Trainer) and trainer.is_global_zero):
     except:
         pass
 
-ckpt_path = f"checkpoint/{project}/{wandb_logger.experiment.name}"
 earlystopping = EarlyStopping(
     monitor="val-totloss",
     patience=2000,
@@ -271,7 +279,7 @@ if full_val_sampling:
         filename="ddpm-{epoch:03d}-{val-rmsd-median:.4f}",
         every_n_epochs=save_every,
         save_top_k=1,
-        save_last=False,
+        save_last=True,
     )
 else:
     checkpoint_callback = ModelCheckpoint(
@@ -286,9 +294,7 @@ callbacks = [earlystopping, checkpoint_callback, TQDMProgressBar(), lr_monitor]
 if training_config["ema"]:
     callbacks.append(EMACallback(decay=training_config["ema_decay"]))
 
-if not os.path.isdir(ckpt_path):
-    os.makedirs(ckpt_path)
-shutil.copy(f"../model/{model_type}.py", f"{ckpt_path}/{model_type}.py")
+shutil.copy(f"../model/{model_type}.py", os.path.join(run_dir, f"{model_type}.py"))
 
 print("config: ", config)
 
@@ -332,16 +338,13 @@ trainer = Trainer(
 # trainer.fit(ddpm,ckpt_path=ckpt)
 
 trainer.fit(ddpm)
-final_ckpt_path = "our_new_pretrained-ts1x-rgd1-diff-h200-dim-2.ckpt"
 if full_val_sampling and checkpoint_callback.best_model_path:
+    final_ckpt_path = os.path.join(ckpt_path, "best.ckpt")
     shutil.copyfile(checkpoint_callback.best_model_path, final_ckpt_path)
     print(
         "Saved final checkpoint from best validation sampling median RMSD: "
         f"{checkpoint_callback.best_model_path} -> {final_ckpt_path}"
     )
-else:
-    trainer.save_checkpoint(final_ckpt_path)
-    print(f"Saved final checkpoint from the last training state: {final_ckpt_path}")
 
 
 """
