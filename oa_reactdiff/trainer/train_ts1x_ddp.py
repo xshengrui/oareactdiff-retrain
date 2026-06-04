@@ -61,9 +61,18 @@ def parse_args():
     parser.add_argument("--max_epochs", type=int, default=2000)
     parser.add_argument("--accumulate_grad_batches", type=int, default=1)
     parser.add_argument("--gradient_clip_val", type=float)
+    parser.add_argument("--hidden_channels", type=int, default=196)
+    parser.add_argument("--num_radial", type=int, default=96)
     parser.add_argument("--project", type=str, default=None)
     parser.add_argument("--run_name", type=str, default=None)
     parser.add_argument("--allow_existing_run_dir", type=str2bool, default=False)
+    parser.add_argument(
+        "--disable_progress_bar",
+        "--silent",
+        dest="disable_progress_bar",
+        type=str2bool,
+        default=False,
+    )
     return parser.parse_args()
 
 
@@ -171,6 +180,8 @@ leftnet_config = dict(
     single_layer_output=True,
     object_aware=True,
 )
+leftnet_config["hidden_channels"] = args.hidden_channels
+leftnet_config["num_radial"] = args.num_radial
 
 if model_type == "leftnet":
     model_config = leftnet_config
@@ -344,7 +355,9 @@ else:
         save_last=True,
     )
 lr_monitor = LearningRateMonitor(logging_interval="step")
-callbacks = [earlystopping, checkpoint_callback, TQDMProgressBar(), lr_monitor]
+callbacks = [earlystopping, checkpoint_callback, lr_monitor]
+if not args.disable_progress_bar:
+    callbacks.append(TQDMProgressBar())
 if training_config["ema"]:
     callbacks.append(EMACallback(decay=training_config["ema_decay"]))
 
@@ -375,6 +388,7 @@ trainer = Trainer(
     strategy=strategy,
     log_every_n_steps=1,
     callbacks=callbacks,
+    enable_progress_bar=not args.disable_progress_bar,
     profiler=None,
     logger=wandb_logger,
     num_sanity_val_steps=0,

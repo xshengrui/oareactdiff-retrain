@@ -32,4 +32,4 @@ def pretty_print(epoch, metric_dict, prefix="Train"):
     out = f"{prefix} epoch {epoch} "
     for k, v in metric_dict.items():
         out += f"{k} {v:.2f} "
-    print(out)
+    print(out, flush=True)

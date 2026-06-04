@@ -357,6 +357,11 @@ class DDPMModule(LightningModule):
         info["loss"] = loss
         return info
 
+    def training_epoch_end(self, outputs) -> None:
+        train_epoch_metrics = average_over_batch_metrics(outputs, allowed=["loss"])
+        if self.trainer.is_global_zero:
+            pretty_print(self.current_epoch, train_epoch_metrics, prefix="train")
+
     def _shared_eval(self, batch, batch_idx, prefix, *args):
         nll, info = self.compute_loss(batch)
         loss = nll.mean(0)
